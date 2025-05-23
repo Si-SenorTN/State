@@ -1,0 +1,9 @@
+[package]
+name = "si-senortn/state"
+version = "0.0.1"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+
+[dependencies]
+Trove = "sleitnick/trove@1.5.0"
+BufferUtil = "sleitnick/buffer-util@0.3.1"

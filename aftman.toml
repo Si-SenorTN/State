@@ -1,0 +1,4 @@
+[tools]
+rojo = "rojo-rbx/rojo@7.4.4"
+selene = "kampfkarren/selene@0.26.1"
+stylua = "johnnymorganz/stylua@0.20.0"
