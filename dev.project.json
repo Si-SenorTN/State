@@ -1,0 +1,14 @@
+{
+	"name": "dev-project",
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"Packages": {
+				"$path": "Packages",
+				"StateManager": {
+					"$path": "src"
+				}
+			}
+		}
+	}
+}

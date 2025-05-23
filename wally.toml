@@ -1,5 +1,5 @@
 [package]
-name = "si-senortn/state"
+name = "si-senortn/state-manager"
 version = "0.0.1"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"

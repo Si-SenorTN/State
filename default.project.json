@@ -1,12 +1,6 @@
 {
-	"name": "State",
+	"name": "state-manager",
 	"tree": {
-		"$className": "DataModel",
-		"$path": "src",
-		"ReplicatedStorage": {
-			"Packages": {
-				"$path": "Packages"
-			}
-		}
+		"$path": "src"
 	}
 }
