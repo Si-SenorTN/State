@@ -11,6 +11,7 @@ local TAG_PREFIX = "state-manager:"
 
 local ERR_NO_CLASSNAME = "[StateManager.new]: State must have a ClassName string"
 local ERR_TYPE_MISMATCH = "[StateManager%s]: Type mismatch, expected %q, got %q"
+local ERR_INCORRECT_RUN_CONTEXT = "[%s.%s]: You cannot %s a server owned state from the client. Please do this on the server"
 
 local Packages = ReplicatedStorage.Packages
 
@@ -135,9 +136,10 @@ function State.Associate(self: State, instance: Instance)
 end
 
 function State.IsAssociated(self: State, instance: Instance)
-	local allAssociates = self._associatesFolder:GetChildren()
-	for _, pointer in allAssociates do
-		if pointer.Value == instance then
+	local proxyFolder = instance:FindFirstChild(PROXY_FOLDER_NAME)
+	if proxyFolder then
+		local pointer = proxyFolder:FindFirstChild(self._instance.Name)
+		if pointer and pointer.Value == self._instance then
 			return true
 		end
 	end
@@ -146,7 +148,7 @@ end
 
 function State.Dissociate(self: State, instance: Instance)
 	if RunService:IsClient() and self._instance:GetAttribute("RunContext") == "server" then
-		error("You cannot dissociate a server owned state from the client. Please do this on the server")
+		error(ERR_INCORRECT_RUN_CONTEXT:format("State", "Dissociate", "dissociate"), 2)
 	end
 	local pointer = self._associatesFolder:FindFirstChild(instance.Name)
 	if pointer then
@@ -167,7 +169,7 @@ end
 
 function State.DissociateAll(self: State)
 	if RunService:IsClient() and self._instance:GetAttribute("RunContext") == "server" then
-		error("You cannot dissociate a server owned state from the client. Please do this on the server")
+		error(ERR_INCORRECT_RUN_CONTEXT:format("State", "DissociateAll", "dissociate"), 2)
 	end
 	local associatesFolder = self._associatesFolder
 	if associatesFolder then
@@ -179,7 +181,7 @@ end
 
 function State.SetValue(self: State, path: { string }, value: any)
 	if RunService:IsClient() and self._instance:GetAttribute("RunContext") == "server" then
-		error("You cannot change a server owned state from the client. Please do this on the server")
+		error(ERR_INCORRECT_RUN_CONTEXT:format("State", "SetValue", "change"), 2)
 	end
 	local pointer = self.Data
 	for i = 1, #path - 1 do
@@ -190,7 +192,7 @@ function State.SetValue(self: State, path: { string }, value: any)
 	local success, valueBase = pcall(Tree.Find, self._instance, table.concat(path, "/"), "ValueBase")
 	if not success then
 		if #path > 1 then
-			error("Path is invalid. You cannot set deep values within waypoints that do not exist")
+			error("Path is invalid. You cannot set deep values within fields that do not exist", 2)
 		end
 
 		assign.fromTable({ [path[1]] = value }, self._instance)
@@ -260,6 +262,23 @@ end
 
 StateManager.fromFolder = State.new
 
+function StateManager.fromInstance(instance: Instance, className: string)
+	local proxyFolder = instance:FindFirstChild(PROXY_FOLDER_NAME)
+	if not proxyFolder then
+		warn(`No associated state was found in {instance:GetFullName()}`)
+	end
+
+	local pointer = proxyFolder:FindFirstChild(("State<%s>"):format(className))
+	if pointer and pointer:IsA("ObjectValue") then
+		local folder = pointer.Value
+		if folder and folder:IsA("Folder") then
+			if folder:HasTag(TAG_PREFIX .. className) then
+				return State.new(folder)
+			end
+		end
+	end
+end
+
 function StateManager.getAll(className: string)
 	local output = {}
 	for _, inst in CollectionService:GetTagged(TAG_PREFIX .. className) do
@@ -306,7 +325,7 @@ end
 function StateManager.destroy(state: State)
 	local handle = state._instance
 	if RunService:IsClient() and handle:GetAttribute("RunContext") == "server" then
-		error("You cannot destroy a server owned state from the client. Please do this on the server")
+		error(ERR_INCORRECT_RUN_CONTEXT:format("StateManager", "destroy", "destroy"), 2)
 	end
 
 	state:DissociateAll()
