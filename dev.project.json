@@ -9,6 +9,14 @@
 					"$path": "src"
 				}
 			}
+		},
+		"ServerScriptService": {
+			"$path": "test/server"
+		},
+		"StarterPlayer": {
+			"StarterPlayerScripts": {
+				"$path": "test/client"
+			}
 		}
 	}
 }
