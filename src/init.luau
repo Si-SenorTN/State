@@ -41,6 +41,7 @@ end
 export type StateOptions = {
 	WillReplicate: boolean,
 	ClassName: string,
+	Parent: Instance,
 }
 
 export type State = {
@@ -50,24 +51,38 @@ export type State = {
 	SetValue: (self: State, path: { string }, value: any) -> (),
 	ObserveChange: (self: State, path: { string }, listener: (value: any) -> ()) -> Trove.Trove,
 
-	Associate: (self: State, instance: Instance) -> (),
+	Associate: (self: State, instance: Instance) -> boolean,
 	IsAssociated: (self: State, instance: Instance) -> boolean,
 
-	Dissociate: (self: State, Instance) -> (),
-	DissociateAll: (self: State) -> (),
+	Dissociate: (self: State, instance: Instance) -> boolean,
+	DissociateAll: (self: State) -> boolean,
 
 	Destroy: (self: State) -> (),
+}
+
+export type StateManager = {
+	new: (options: StateOptions, defaultData: { [string?]: any }) -> State,
+
+	observe: (className: string, listener: (state: State) -> ()) -> () -> (),
+
+	getAll: (className: string) -> { State },
+	fromFolder: (stateFolder: Folder) -> State | nil,
+	fromInstance: (instance: Instance) -> State | nil,
+
+	destroy: (state: State) -> (),
 }
 
 local State = {}
 State.__index = State
 
-function State.new(stateFolder: Folder): State
-	local self = setmetatable({}, State)
+function State.new(stateFolder: Folder)
+	local self = setmetatable({}, State) :: State
 	self.Trove = Trove.new()
-	self.Data = assign.fromFolder(stateFolder)
 
 	self._instance = stateFolder
+
+	self._dataFolder = assert(stateFolder:WaitForChild("Data", 5), "What happened to the data folder??")
+	self.Data = assign.fromFolder(self._dataFolder)
 
 	if RunService:IsClient() and stateFolder:GetAttribute("RunContext") == "server" then
 		self._associatesFolder = stateFolder:WaitForChild(ASSOCIATES_FOLDER_NAME, 5)
@@ -84,12 +99,18 @@ function State.new(stateFolder: Folder): State
 		self:Destroy()
 	end)
 
-	for _, valueBase in self._instance:GetDescendants() do
+	local watchingValueBases = self.Trove:Extend()
+	local function onValueBaseAdded(valueBase)
 		if valueBase:IsA("ValueBase") then
-			self.Trove:Connect(valueBase.Changed, function(newValue)
+			local inner = watchingValueBases:Extend()
+			inner:Connect(valueBase.Destroying, function()
+				watchingValueBases:Remove(inner)
+			end)
+
+			local function onValueChanged(newValue)
 				local parent = valueBase.Parent
 				local path = { valueBase.Name }
-				while parent ~= self._instance do
+				while parent ~= self._dataFolder do
 					table.insert(path, 1, parent.Name)
 					parent = parent.Parent
 				end
@@ -99,21 +120,29 @@ function State.new(stateFolder: Folder): State
 					pointer = pointer[path[i]]
 				end
 				pointer[path[#path]] = newValue
-			end)
+			end
+
+			inner:Connect(valueBase.Changed, onValueChanged)
+			onValueChanged(valueBase.Value)
 		end
 	end
+
+	for _, valueBase in self._dataFolder:GetDescendants() do
+		task.spawn(onValueBaseAdded, valueBase)
+	end
+	self.Trove:Connect(self._dataFolder.DescendantAdded, onValueBaseAdded)
 
 	return self
 end
 
 function State.Associate(self: State, instance: Instance)
 	if RunService:IsClient() and self._instance:GetAttribute("RunContext") == "server" then
-		error("You cannot associate a server owned state from the client. Please do this on the server")
+		error(ERR_INCORRECT_RUN_CONTEXT:format("State", "Associate", "associate"), 2)
 	end
 
 	if self:IsAssociated(instance) then
-		warn(`This state is already associated with {instance:GetFullName()}`)
-		return
+		warn(`[State.Associate]: This state is already associated with {instance:GetFullName()}`)
+		return false
 	end
 
 	local proxyFolder = getOrCreate(instance, PROXY_FOLDER_NAME, "Folder")
@@ -121,7 +150,7 @@ function State.Associate(self: State, instance: Instance)
 		warn(
 			`A state with the same class name, {self._instance.Name} was already found in {instance:GetFullName()}.\nPlease dissociate that state before associating this one`
 		)
-		return
+		return false
 	end
 
 	local pointer = Instance.new("ObjectValue")
@@ -133,6 +162,8 @@ function State.Associate(self: State, instance: Instance)
 	proxy.Name = self._instance.Name
 	proxy.Value = self._instance
 	proxy.Parent = proxyFolder
+
+	return true
 end
 
 function State.IsAssociated(self: State, instance: Instance)
@@ -146,24 +177,29 @@ function State.IsAssociated(self: State, instance: Instance)
 	return false
 end
 
+local function dissociate(className: string, pointer: ObjectValue)
+	local inst = pointer.Value
+	local proxyFolder = inst:FindFirstChild(PROXY_FOLDER_NAME)
+	if proxyFolder then
+		local proxyPointer = assert(proxyFolder:FindFirstChild(className), "Missing ProxyPointer")
+		if proxyPointer then
+			proxyPointer:Destroy()
+		end
+	end
+	pointer:Destroy()
+end
+
 function State.Dissociate(self: State, instance: Instance)
 	if RunService:IsClient() and self._instance:GetAttribute("RunContext") == "server" then
 		error(ERR_INCORRECT_RUN_CONTEXT:format("State", "Dissociate", "dissociate"), 2)
 	end
 	local pointer = self._associatesFolder:FindFirstChild(instance.Name)
 	if pointer then
-		local className = pointer.Name
-		local inst = pointer.Value
-		local proxyFolder = inst:FindFirstChild(PROXY_FOLDER_NAME)
-		if proxyFolder then
-			local proxyPointer = proxyFolder:FindFirstChild(className)
-			if proxyPointer then
-				proxyPointer:Destroy()
-			end
-		end
-		pointer:Destroy()
+		dissociate(self._instance.Name, pointer)
+		return true
 	else
 		warn(`{instance:GetFullName()} was not associated with {self._instance.Name}`)
+		return false
 	end
 end
 
@@ -174,52 +210,60 @@ function State.DissociateAll(self: State)
 	local associatesFolder = self._associatesFolder
 	if associatesFolder then
 		for _, pointer in associatesFolder:GetChildren() do
-			self:Dissociate(pointer.Value)
+			dissociate(self._instance.Name, pointer)
 		end
+		return true
 	end
+	return false
 end
 
 function State.SetValue(self: State, path: { string }, value: any)
 	if RunService:IsClient() and self._instance:GetAttribute("RunContext") == "server" then
 		error(ERR_INCORRECT_RUN_CONTEXT:format("State", "SetValue", "change"), 2)
 	end
-	local pointer = self.Data
-	for i = 1, #path - 1 do
-		pointer = pointer[path[i]]
-	end
-	pointer[path[#path]] = value
 
-	local success, valueBase = pcall(Tree.Find, self._instance, table.concat(path, "/"), "ValueBase")
+	local success, valueBase = pcall(Tree.Find, self._dataFolder, table.concat(path, "/"), "ValueBase")
 	if not success then
 		if #path > 1 then
-			error("Path is invalid. You cannot set deep values within fields that do not exist", 2)
+			error("[State.SetValue]: Path is invalid. You cannot set deep values within fields that do not exist", 2)
 		end
 
-		assign.fromTable({ [path[1]] = value }, self._instance)
-		valueBase = self._instance:FindFirstChild(path[1])
+		assign.fromTable({ [path[1]] = value }, self._dataFolder)
+		valueBase = self._dataFolder:FindFirstChild(path[1])
 	end
 
 	if valueBase and valueBase:IsA("ValueBase") then
 		valueBase.Value = value
+	else
+		local pointer = self.Data
+		for i = 1, #path - 1 do
+			pointer = pointer[path[i]]
+		end
+		pointer[path[#path]] = value
 	end
 end
 
 function State.ObserveChange(self: State, path: { string }, listener: (value: any) -> ())
-	local valueBase = Tree.Await(self._instance, table.concat(path, "/"), 5, "ValueBase")
+	local valueBase = Tree.Await(self._dataFolder, table.concat(path, "/"), 5, "ValueBase")
 	if valueBase then
 		local trove = self.Trove:Extend()
 		task.spawn(listener, valueBase.Value)
 		trove:Connect(valueBase.Changed, listener)
-		return trove
+		return function()
+			trove:Destroy()
+		end
 	end
 	return nil
 end
 
 function State.Destroy(self: State)
 	self.Trove:Destroy()
+
+	table.clear(self)
+	setmetatable(self, nil)
 end
 
-local StateManager = {}
+local StateManager = {} :: StateManager
 
 function StateManager.new(options: StateOptions, defaultData: { [string]: any })
 	local className = assert(options.ClassName, ERR_NO_CLASSNAME)
@@ -229,18 +273,17 @@ function StateManager.new(options: StateOptions, defaultData: { [string]: any })
 		options.WillReplicate = true
 	end
 
-	local Tags = options.Tags
-	if Tags then
-		assert(typeof(Tags) == "table", ERR_TYPE_MISMATCH:format(".new", "table", typeof(Tags)))
-	end
-
 	local stateFolder = Instance.new("Folder")
 	stateFolder.Name = ("State<%s>"):format(className)
 	stateFolder:SetAttribute("ClassName", className)
 	stateFolder:SetAttribute("RunContext", if RunService:IsServer() then "server" else "client")
 
+	local dataFolder = Instance.new("Folder")
+	dataFolder.Name = "Data"
+	dataFolder.Parent = stateFolder
+
 	if defaultData then
-		assign.fromTable(defaultData, stateFolder)
+		assign.fromTable(defaultData, dataFolder)
 	end
 
 	local parent = options.Parent
@@ -265,7 +308,8 @@ StateManager.fromFolder = State.new
 function StateManager.fromInstance(instance: Instance, className: string)
 	local proxyFolder = instance:FindFirstChild(PROXY_FOLDER_NAME)
 	if not proxyFolder then
-		warn(`No associated state was found in {instance:GetFullName()}`)
+		warn(`[StateManager.fromInstance]: No associated state was found in {instance:GetFullName()}`)
+		return nil
 	end
 
 	local pointer = proxyFolder:FindFirstChild(("State<%s>"):format(className))
@@ -277,12 +321,13 @@ function StateManager.fromInstance(instance: Instance, className: string)
 			end
 		end
 	end
+	return nil
 end
 
 function StateManager.getAll(className: string)
 	local output = {}
 	for _, inst in CollectionService:GetTagged(TAG_PREFIX .. className) do
-		output[inst.Name] = State.new(inst)
+		table.insert(output, State.new(inst))
 	end
 	return output
 end
@@ -319,6 +364,64 @@ function StateManager.observe(className: string, listener: (state: State) -> ())
 
 	return function()
 		observerTrove:Destroy()
+	end
+end
+
+function StateManager.observeInstance(instance: Instance, className: string, listener: (state: State) -> ())
+	local trove = Trove.new()
+	local inner = trove:Extend()
+
+	local function watchFolder(folder: Folder)
+		local snapShots = {}
+		local function onPointerAdded(pointer: ObjectValue)
+			if pointer:IsA("ObjectValue") then
+				local stateFolder = pointer.Value
+				if stateFolder:GetAttribute("ClassName") == className then
+					local state = State.new(stateFolder)
+					snapShots[pointer] = state
+					task.spawn(listener, state)
+				end
+			else
+				warn(
+					`[StateManager.observeInstance]: An unknown instance entered {folder:GetFullName()}\nName: {pointer.Name}\nClass: {pointer.ClassName}`
+				)
+			end
+		end
+		for _, pointer in folder:GetChildren() do
+			onPointerAdded(pointer)
+		end
+		inner:Connect(folder.ChildAdded, onPointerAdded)
+		inner:Connect(folder.ChildRemoved, function(child)
+			if child:IsA("ObjectValue") then
+				local state = snapShots[child]
+				if state then
+					state:Destroy()
+				end
+			end
+		end)
+	end
+
+	local proxyFolder = instance:FindFirstChild(PROXY_FOLDER_NAME)
+	trove:Connect(instance.ChildAdded, function(child)
+		if child:IsA("Folder") and child.Name == PROXY_FOLDER_NAME then
+			watchFolder(child)
+			proxyFolder = child
+		end
+	end)
+
+	trove:Connect(instance.ChildRemoved, function(child)
+		if child == proxyFolder then
+			inner:Destroy()
+			proxyFolder = nil
+		end
+	end)
+
+	if proxyFolder then
+		watchFolder(proxyFolder)
+	end
+
+	return function()
+		trove:Destroy()
 	end
 end
 
