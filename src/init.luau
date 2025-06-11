@@ -9,6 +9,8 @@ local ASSOCIATES_FOLDER_NAME = "__state-associates__"
 local PROXY_FOLDER_NAME = "__state-associates__"
 local TAG_PREFIX = "state-manager:"
 
+local NIL_TOKEN = table.freeze({})
+
 local ERR_NO_CLASSNAME = "[StateManager.new]: State must have a ClassName string"
 local ERR_TYPE_MISMATCH = "[StateManager%s]: Type mismatch, expected %q, got %q"
 local ERR_INCORRECT_RUN_CONTEXT = "[%s.%s]: You cannot %s a server owned state from the client. Please do this on the server"
@@ -60,7 +62,7 @@ export type State = {
 	Destroy: (self: State) -> (),
 }
 
-export type StateManager = {
+type StateManager = {
 	new: (options: StateOptions, defaultData: { [string?]: any }) -> State,
 
 	observe: (className: string, listener: (state: State) -> ()) -> () -> (),
@@ -71,6 +73,44 @@ export type StateManager = {
 
 	destroy: (state: State) -> (),
 }
+
+local function getFromPath(data: { [string]: any }, path: { string })
+	local pointer = data
+	for i = 1, #path - 1 do
+		pointer = pointer[path[i]]
+	end
+
+	return pointer[path[#path]]
+end
+
+local function pathExists(data: { [string]: any }, path: { string })
+	local pointer = data
+	for i = 1, #path - 1 do
+		pointer = pointer[path[i]]
+		if pointer == nil then
+			return false
+		end
+	end
+	return true
+end
+
+local function setFromPath(data: { [string]: any }, path: { string }, newValue: any)
+	local pointer = data
+	for i = 1, #path - 1 do
+		pointer = pointer[path[i]]
+	end
+	pointer[path[#path]] = newValue
+end
+
+local function walkUpPath(topParent: Instance, descendant: Instance)
+	local parent = descendant.Parent
+	local path = { descendant.Name }
+	while parent ~= topParent do
+		table.insert(path, 1, parent.Name)
+		parent = parent.Parent
+	end
+	return path
+end
 
 local State = {}
 State.__index = State
@@ -96,6 +136,7 @@ function State.new(stateFolder: Folder)
 	end
 
 	self.Trove:Connect(stateFolder.Destroying, function()
+		self:DissociateAll()
 		self:Destroy()
 	end)
 
@@ -103,27 +144,27 @@ function State.new(stateFolder: Folder)
 	local function onValueBaseAdded(valueBase)
 		if valueBase:IsA("ValueBase") then
 			local inner = watchingValueBases:Extend()
-			inner:Connect(valueBase.Destroying, function()
-				watchingValueBases:Remove(inner)
-			end)
-
+			local path = walkUpPath(self._dataFolder, valueBase)
 			local function onValueChanged(newValue)
-				local parent = valueBase.Parent
-				local path = { valueBase.Name }
-				while parent ~= self._dataFolder do
-					table.insert(path, 1, parent.Name)
-					parent = parent.Parent
-				end
-
-				local pointer = self.Data
-				for i = 1, #path - 1 do
-					pointer = pointer[path[i]]
-				end
-				pointer[path[#path]] = newValue
+				setFromPath(self.Data, path, newValue)
 			end
 
+			inner:Connect(valueBase.Destroying, function()
+				if pathExists(self.Data, path) then
+					setFromPath(self.Data, path, nil)
+				end
+				watchingValueBases:Remove(inner)
+			end)
 			inner:Connect(valueBase.Changed, onValueChanged)
 			onValueChanged(valueBase.Value)
+		elseif valueBase:IsA("Folder") then
+			local inner = watchingValueBases:Extend()
+			local path = walkUpPath(self._dataFolder, valueBase)
+			setFromPath(self.Data, path, assign.fromFolder(valueBase))
+			inner:Connect(valueBase.Destroying, function()
+				setFromPath(self.Data, path, nil)
+				watchingValueBases:Remove(inner)
+			end)
 		end
 	end
 
@@ -177,7 +218,7 @@ function State.IsAssociated(self: State, instance: Instance)
 	return false
 end
 
-local function dissociate(className: string, pointer: ObjectValue)
+local function unsafeDissociate(className: string, pointer: ObjectValue)
 	local inst = pointer.Value
 	local proxyFolder = inst:FindFirstChild(PROXY_FOLDER_NAME)
 	if proxyFolder then
@@ -195,8 +236,13 @@ function State.Dissociate(self: State, instance: Instance)
 	end
 	local pointer = self._associatesFolder:FindFirstChild(instance.Name)
 	if pointer then
-		dissociate(self._instance.Name, pointer)
-		return true
+		local ok, errorMessage = pcall(unsafeDissociate, self._instance.Name, pointer)
+		if ok then
+			return true
+		else
+			warn(errorMessage)
+			return false
+		end
 	else
 		warn(`{instance:GetFullName()} was not associated with {self._instance.Name}`)
 		return false
@@ -210,50 +256,99 @@ function State.DissociateAll(self: State)
 	local associatesFolder = self._associatesFolder
 	if associatesFolder then
 		for _, pointer in associatesFolder:GetChildren() do
-			dissociate(self._instance.Name, pointer)
+			local ok, errorMessage = pcall(unsafeDissociate, self._instance.Name, pointer)
+			if not ok then
+				warn(errorMessage)
+			end
 		end
 		return true
 	end
 	return false
 end
 
-function State.SetValue(self: State, path: { string }, value: any)
+function State.SetValue(self: State, path: { string }, value: assign.ValuseBaseCompatible)
+	if not assign.isValidType(value) then
+		error(`[State.SetValue]: Invalid type "{typeof(value)}". Cannot convert to a ValueBase or Folder`)
+	end
+
 	if RunService:IsClient() and self._instance:GetAttribute("RunContext") == "server" then
 		error(ERR_INCORRECT_RUN_CONTEXT:format("State", "SetValue", "change"), 2)
 	end
 
-	local success, valueBase = pcall(Tree.Find, self._dataFolder, table.concat(path, "/"), "ValueBase")
+	local success, valueBase = pcall(Tree.Find, self._dataFolder, table.concat(path, "/"))
 	if not success then
-		if #path > 1 then
-			error("[State.SetValue]: Path is invalid. You cannot set deep values within fields that do not exist", 2)
+		if value == NIL_TOKEN then
+			error("[State.SetValue]: Cannot set a non-existant value to Nil")
 		end
 
-		assign.fromTable({ [path[1]] = value }, self._dataFolder)
-		valueBase = self._dataFolder:FindFirstChild(path[1])
+		if #path > 1 then
+			local p = table.move(path, 1, #path - 1, 1, {})
+			local ok, folder = pcall(Tree.Find, self._dataFolder, table.concat(p, "/"), "Folder")
+			if not ok then
+				error("[State.SetValue]: Path is invalid. You cannot set deep values within values or fields that do not exist", 2)
+			end
+			assign.fromTable({ [path[#path]] = value }, folder)
+			valueBase = folder:FindFirstChild(path[#path])
+		else
+			assign.fromTable({ [path[1]] = value }, self._dataFolder)
+			valueBase = self._dataFolder:FindFirstChild(path[1])
+			return
+		end
 	end
 
-	if valueBase and valueBase:IsA("ValueBase") then
-		valueBase.Value = value
-	else
-		local pointer = self.Data
-		for i = 1, #path - 1 do
-			pointer = pointer[path[i]]
+	if valueBase and (valueBase:IsA("ValueBase") or valueBase:IsA("Folder")) then
+		if value == NIL_TOKEN then
+			valueBase:Destroy()
+		elseif valueBase:IsA("ValueBase") then
+			if typeof(value) ~= typeof(valueBase.Value) then
+				error("[State.SetValue]: You cannot change a fields data type.\nConsider Setting the value to Nil and then setting it")
+			else
+				valueBase.Value = value
+			end
+		else
+			error("[State.SetValue]: Cannot change a tables value. Consider setting it to Nil and then setting it", 2)
 		end
-		pointer[path[#path]] = value
+	else
+		error("[State.SetValue]: Attempting to set an unknown value", 2)
 	end
 end
 
-function State.ObserveChange(self: State, path: { string }, listener: (value: any) -> ())
-	local valueBase = Tree.Await(self._dataFolder, table.concat(path, "/"), 5, "ValueBase")
-	if valueBase then
-		local trove = self.Trove:Extend()
-		task.spawn(listener, valueBase.Value)
-		trove:Connect(valueBase.Changed, listener)
-		return function()
-			trove:Destroy()
+function State.ObserveChange(self: State, path: { string }, listener: (value: any, trove: Trove.Trove) -> ())
+	local trove = self.Trove:Extend()
+	local isTracking = false
+	local pathString = table.concat(path, "/")
+	local function onDescendantsChanged()
+		local success, valueBase = pcall(Tree.Find, self._dataFolder, pathString)
+		if success and not isTracking then
+			isTracking = true
+			local inner = trove:Extend()
+			inner:Add(function()
+				isTracking = false
+			end)
+
+			if valueBase:IsA("ValueBase") then
+				task.spawn(listener, valueBase.Value, inner)
+				inner:Connect(valueBase.Changed, listener)
+			elseif valueBase:IsA("Folder") then
+				task.spawn(listener, getFromPath(self.Data, path), inner)
+				warn(
+					`[State.ObserveChange]: path "{pathString}" is a table value`
+						.. `\nChanges to its members will not be reflected`
+						.. `\nConsider listening to the tables fields instead`
+				)
+			end
+			inner:Connect(valueBase.Destroying, function()
+				trove:Remove(inner)
+			end)
 		end
 	end
-	return nil
+
+	onDescendantsChanged()
+	trove:Connect(self._dataFolder.DescendantAdded, onDescendantsChanged)
+
+	return function()
+		trove:Destroy()
+	end
 end
 
 function State.Destroy(self: State)
@@ -264,6 +359,7 @@ function State.Destroy(self: State)
 end
 
 local StateManager = {} :: StateManager
+StateManager.Nil = NIL_TOKEN
 
 function StateManager.new(options: StateOptions, defaultData: { [string]: any })
 	local className = assert(options.ClassName, ERR_NO_CLASSNAME)
@@ -298,9 +394,7 @@ function StateManager.new(options: StateOptions, defaultData: { [string]: any })
 
 	CollectionService:AddTag(stateFolder, TAG_PREFIX .. className)
 
-	local state = State.new(stateFolder)
-
-	return state
+	return State.new(stateFolder)
 end
 
 StateManager.fromFolder = State.new
