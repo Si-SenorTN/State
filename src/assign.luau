@@ -1,3 +1,5 @@
+export type ValuseBaseCompatible = string | number | boolean | Instance | Vector3 | Vector2 | CFrame | Color3 | BrickColor | Ray
+
 local ASSOCIATES_FOLDER_NAME = "__state-associates__"
 local TYPE_MAP = {
 	string = "StringValue",
@@ -8,8 +10,10 @@ local TYPE_MAP = {
 	Vector2 = "Vector2Value",
 	CFrame = "CFrameValue",
 	Color3 = "Color3Value",
+	BrickColor = "BrickColorValue",
+	Ray = "RayValue",
 }
-local WARN_DISALLOWED_TYPE = "[StateManager%s]: Type of %q cannot be converted to a ValueBase instance, Ignoring"
+local ERROR_DISALLOWED_TYPE = "[StateManager%s]: Type of %q cannot be converted to a ValueBase instance"
 
 local assign = {}
 
@@ -43,8 +47,16 @@ function assign.fromTable(source: { [string]: any }, folder: Folder)
 			subFolder.Parent = folder
 			assign.fromTable(value, subFolder)
 		else
-			warn(WARN_DISALLOWED_TYPE:format(".new", class))
+			error(ERROR_DISALLOWED_TYPE:format(".new", class), 2)
 		end
+	end
+end
+
+function assign.isValidType(typeString: string)
+	if TYPE_MAP[typeString] then
+		return true
+	else
+		return false
 	end
 end
 
