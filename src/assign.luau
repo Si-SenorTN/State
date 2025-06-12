@@ -1,4 +1,4 @@
-export type ValuseBaseCompatible = string | number | boolean | Instance | Vector3 | Vector2 | CFrame | Color3 | BrickColor | Ray
+export type ValueBaseCompatible = string | number | boolean | Instance | Vector3 | Vector2 | CFrame | Color3 | BrickColor | Ray | table
 
 local ASSOCIATES_FOLDER_NAME = "__state-associates__"
 local TYPE_MAP = {
@@ -12,6 +12,7 @@ local TYPE_MAP = {
 	Color3 = "Color3Value",
 	BrickColor = "BrickColorValue",
 	Ray = "RayValue",
+	table = "Folder",
 }
 local ERROR_DISALLOWED_TYPE = "[StateManager%s]: Type of %q cannot be converted to a ValueBase instance"
 
@@ -39,13 +40,12 @@ function assign.fromTable(source: { [string]: any }, folder: Folder)
 		if class then
 			local inst = Instance.new(class)
 			inst.Name = name
-			inst.Value = value
+			if inst:IsA("ValueBase") then
+				inst.Value = value
+			else
+				assign.fromTable(value, inst)
+			end
 			inst.Parent = folder
-		elseif typeof(value) == "table" then
-			local subFolder = Instance.new("Folder")
-			subFolder.Name = name
-			subFolder.Parent = folder
-			assign.fromTable(value, subFolder)
 		else
 			error(ERROR_DISALLOWED_TYPE:format(".new", class), 2)
 		end
