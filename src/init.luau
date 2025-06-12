@@ -1,12 +1,15 @@
 local CollectionService = game:GetService("CollectionService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
 local ServerStorage = game:GetService("ServerStorage")
 
 local DEFAULT_FOLDER_NAME = "__state-manager-default-folder__"
 local HIDDEN_FOLDER_NAME = "__state-manager-hidden-folder__"
 local ASSOCIATES_FOLDER_NAME = "__state-associates__"
 local PROXY_FOLDER_NAME = "__state-associates__"
+local WRITE_EVENT_NAME = "URE_StateWrite"
+local LOCAL_WRITE_EVENT_NAME = "BE_StateWrite"
 local TAG_PREFIX = "state-manager:"
 
 local NIL_TOKEN = table.freeze({})
@@ -19,6 +22,7 @@ local Packages = ReplicatedStorage.Packages
 
 local Trove = require(Packages.Trove)
 local Tree = require(Packages.Tree)
+local BufferUtil = require(Packages.BufferUtil)
 
 local assign = require(script.assign)
 
@@ -44,6 +48,7 @@ export type StateOptions = {
 	WillReplicate: boolean,
 	ClassName: string,
 	Parent: Instance,
+	WriteLib: ModuleScript,
 }
 
 export type State = {
@@ -120,6 +125,16 @@ local function walkUpPath(topParent: Instance, descendant: Instance)
 	return path
 end
 
+local function invokeWriteLibListeners(state: State, funcName)
+	for _, func in state._writeLibListeners[funcName] do
+		task.spawn(func)
+	end
+end
+
+local function canReplicate(inst: Instance)
+	return not inst:IsDescendantOf(ServerScriptService) and not inst:IsDescendantOf(ServerStorage)
+end
+
 local State = {}
 State.__index = State
 
@@ -132,8 +147,27 @@ function State.new(stateFolder: Folder)
 	self._dataFolder = assert(stateFolder:WaitForChild("Data", 5), "What happened to the data folder??")
 	self.Data = assign.fromFolder(self._dataFolder)
 
+	local writeLib = self._instance:FindFirstChild("WriteLib")
+	if writeLib then
+		self._writeLib = require(writeLib.Value)
+		self._writeLibListeners = {}
+		for funcName in self._writeLib do
+			self._writeLibListeners[funcName] = {}
+		end
+	end
+
 	if RunService:IsClient() and stateFolder:GetAttribute("RunContext") == "server" then
-		self._associatesFolder = stateFolder:WaitForChild(ASSOCIATES_FOLDER_NAME, 5)
+		self._associatesFolder = stateFolder:WaitForChild(ASSOCIATES_FOLDER_NAME, 60)
+
+		if writeLib then
+			local unreliableEvent: UnreliableRemoteEvent = assert(stateFolder:WaitForChild(WRITE_EVENT_NAME, 60), "Missing remote event for WriteLib")
+			self.Trove:Connect(unreliableEvent.OnClientEvent, function(buf)
+				local reader = BufferUtil.reader(buf)
+				local funcName = reader:ReadString()
+				invokeWriteLibListeners(self, funcName)
+			end)
+		end
+
 		if not self._associatesFolder then
 			self._associatesFolder = Instance.new("Folder")
 			self._associatesFolder.Name = ASSOCIATES_FOLDER_NAME
@@ -141,6 +175,20 @@ function State.new(stateFolder: Folder)
 		end
 	else
 		self._associatesFolder = getOrCreate(stateFolder, ASSOCIATES_FOLDER_NAME, "Folder")
+
+		if writeLib then
+			if RunService:IsServer() or stateFolder:GetAttribute("RunContext") == "client" then
+				self._be = getOrCreate(stateFolder, LOCAL_WRITE_EVENT_NAME, "BindableEvent")
+			else
+				self._be = stateFolder:WaitForChild(LOCAL_WRITE_EVENT_NAME, 60)
+			end
+			self.Trove:Connect(self._be.Event, function(funcName)
+				invokeWriteLibListeners(self, funcName)
+			end)
+			if RunService:IsServer() and canReplicate(self._instance) then
+				self._unreliableEvent = getOrCreate(stateFolder, WRITE_EVENT_NAME, "UnreliableRemoteEvent")
+			end
+		end
 	end
 
 	self.Trove:Connect(stateFolder.Destroying, function()
@@ -182,6 +230,48 @@ function State.new(stateFolder: Folder)
 	self.Trove:Connect(self._dataFolder.DescendantAdded, onValueBaseAdded)
 
 	return self
+end
+
+function State.Write(self: State, funcName: string, ...: any)
+	if RunService:IsClient() and self._instance:GetAttribute("RunContext") == "server" then
+		error(ERR_INCORRECT_RUN_CONTEXT:format("State", "Write", "make write calls to"), 2)
+	end
+
+	if not self._writeLib then
+		error("[State.Write]: No WriteLib present", 2)
+	end
+
+	local func = self._writeLib[funcName]
+	if func then
+		task.spawn(func, self, ...)
+
+		if self._be then
+			self._be:Fire(funcName)
+		end
+		if self._unreliableEvent then
+			local writer = BufferUtil.writer()
+			writer:WriteString(funcName)
+			self._unreliableEvent:FireAllClients(writer:GetBuffer())
+		end
+	else
+		error(`[State.Write]: Function name "{funcName}" does not exist within WriteLib`, 2)
+	end
+end
+
+function State.ListenToWrite(self: State, funcName: string, listener: () -> ())
+	if not self._writeLib then
+		error("[State.ListenToWrite]: No WriteLib present", 2)
+	end
+
+	local directory = self._writeLibListeners[funcName]
+	if directory then
+		table.insert(self._writeLibListeners[funcName], listener)
+		return function()
+			table.remove(self._writeLibListeners[funcName], table.find(self._writeLibListeners[funcName], listener))
+		end
+	else
+		error(`"[State.ListenToWrite]: Function name "{funcName}" does not exist within WriteLib`, 2)
+	end
 end
 
 function State.Associate(self: State, instance: Instance)
@@ -559,6 +649,22 @@ function StateManager.new(options: StateOptions, defaultData: { [string]: any })
 
 	if defaultData then
 		assign.fromTable(defaultData, dataFolder)
+	end
+
+	if options.WriteLib then
+		local modErr = "[StateManager.new]: WriteLib must be a ModuleScript instance"
+		assert(typeof(options.WriteLib) == "Instance", modErr)
+		assert(options.WriteLib:IsA("ModuleScript"), modErr)
+
+		if RunService:IsServer() and options.WillReplicate == true and canReplicate(options.WriteLib) == false then
+			warn("[StateManager.new]: WriteLib is not in a replicable Container.\nAttempting manual WriteLib move")
+			options.WriteLib.Parent = ReplicatedStorage
+		end
+
+		local pointer = Instance.new("ObjectValue")
+		pointer.Name = "WriteLib"
+		pointer.Value = options.WriteLib
+		pointer.Parent = stateFolder
 	end
 
 	local parent = options.Parent
