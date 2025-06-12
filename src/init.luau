@@ -50,8 +50,16 @@ export type State = {
 	Trove: Trove.Trove,
 	Data: { [string]: any },
 
-	SetValue: (self: State, path: { string }, value: any) -> (),
-	ObserveChange: (self: State, path: { string }, listener: (value: any) -> ()) -> Trove.Trove,
+	SetValue: (self: State, path: { string }, value: assign.ValueBaseCompatible) -> (),
+	ArrayInsert: (self: State, path: { string }, value: assign.ValueBaseCompatible, index: number?) -> (),
+	ArrayRemove: (self: State, path: { string }, index: number) -> (),
+
+	ObserveValue: (self: State, path: { string }, listener: (value: assign.ValueBaseCompatible) -> ()) -> Trove.Trove,
+	ObserveArray: (
+		self: State,
+		path: { string },
+		listener: (value: assign.ValueBaseCompatible, index: number, trove: Trove.Trove) -> ()
+	) -> () -> (),
 
 	Associate: (self: State, instance: Instance) -> boolean,
 	IsAssociated: (self: State, instance: Instance) -> boolean,
@@ -189,7 +197,8 @@ function State.Associate(self: State, instance: Instance)
 	local proxyFolder = getOrCreate(instance, PROXY_FOLDER_NAME, "Folder")
 	if proxyFolder:FindFirstChild(self._instance.Name) then
 		warn(
-			`A state with the same class name, {self._instance.Name} was already found in {instance:GetFullName()}.\nPlease dissociate that state before associating this one`
+			`A state with the same class name, {self._instance.Name} was already found in {instance:GetFullName()}.`
+				.. `\nPlease dissociate that state before associating this one`
 		)
 		return false
 	end
@@ -266,8 +275,8 @@ function State.DissociateAll(self: State)
 	return false
 end
 
-function State.SetValue(self: State, path: { string }, value: assign.ValuseBaseCompatible)
-	if not assign.isValidType(value) then
+function State.SetValue(self: State, path: { string }, value: assign.ValueBaseCompatible)
+	if not assign.isValidType(typeof(value)) then
 		error(`[State.SetValue]: Invalid type "{typeof(value)}". Cannot convert to a ValueBase or Folder`)
 	end
 
@@ -313,7 +322,177 @@ function State.SetValue(self: State, path: { string }, value: assign.ValuseBaseC
 	end
 end
 
-function State.ObserveChange(self: State, path: { string }, listener: (value: any, trove: Trove.Trove) -> ())
+function State.ArrayInsert(self: State, path: { string }, value: assign.ValueBaseCompatible, index: number?)
+	if not assign.isValidType(typeof(value)) then
+		error(`[State.ArrayInsert]: Invalid type "{typeof(value)}". Cannot convert to a ValueBase or Folder`, 2)
+	end
+
+	if value == NIL_TOKEN then
+		error("[State.ArrayInsert]: Cannot insert a Nil Token", 2)
+	end
+
+	local success, folder = pcall(Tree.Find, self._dataFolder, table.concat(path, "/"), "Folder")
+	if not success then
+		local errorMessage = folder
+		error("[State.ArrayInsert]: " .. errorMessage, 2)
+	end
+
+	if index and index < 1 then
+		index = 1
+	end
+
+	local maxNum = #folder:GetChildren() + 1
+	if not index or index > maxNum then
+		index = maxNum
+	end
+
+	for i, v in folder:GetChildren() do
+		if i >= index then
+			v.Name = tostring(i + 1)
+		end
+	end
+	assign.fromTable({ [index] = value }, folder)
+end
+
+function State.ArrayRemove(self: State, path: { string }, index: number)
+	if typeof(index) ~= "number" then
+		error("[State.ArrayRemove]: You can only remove a numeric index", 2)
+	end
+
+	local success, folder = pcall(Tree.Find, self._dataFolder, table.concat(path, "/"), "Folder")
+	if not success then
+		local errorMessage = folder
+		error("[State.ArrayRemove]: " .. errorMessage)
+	end
+
+	index = math.clamp(index, 1, #folder:GetChildren())
+
+	local value = folder:FindFirstChild(tostring(index))
+	if not value then
+		error("[State.ArrayRemove]: Attempt to remove an index that does not exist", 2)
+	end
+
+	for _, v in folder:GetChildren() do
+		local currentIndex = tonumber(v.Name)
+		if currentIndex > index then
+			v.Name = tostring(currentIndex - 1)
+		end
+	end
+	value:Destroy()
+end
+
+--[=[
+	Observe items inside an array. Will subscribe to **every single** change.
+
+	Index changes will trigger the listener
+
+	Value changes will trigger the listener
+
+	Tables set as values **will not** reflect changes, so be careful using tables as values.
+
+	```lua
+		state:ObserveArray({ "Names" }, function(value, index, trove)
+			print(index, "is now", value)
+
+			trove:Add(function()
+				print(value, "was removed")
+			end)
+		end)
+
+		state:ArrayInsert({ "Names" }, "John")
+		state:ArrayInsert({ "Names" }, "Jane")
+		state:ArrayInsert({ "Names" }, "Joe")
+		-- 1 is now John
+		-- 2 is now Jane
+		-- 3 is now Joe
+		state:ArrayRemove({ "Names" }, 2)
+		-- Jane was removed
+		-- 2 is now Joe
+	```
+]=]
+function State.ObserveArray(self: State, path: { string }, listener: (value: assign.ValueBaseCompatible, index: number, trove: Trove.Trove) -> ())
+	local trove = self.Trove:Extend()
+	local pathString = table.concat(path, "/")
+	local isTracking = false
+	local function onDescendantsChanged()
+		if isTracking then
+			return
+		end
+		isTracking = true
+		local success, folder = pcall(Tree.Find, self._dataFolder, pathString, "Folder")
+		if success then
+			local watcher = trove:Extend()
+			watcher:Add(function()
+				isTracking = false
+			end)
+			watcher:Connect(folder.Destroying, function()
+				trove:Remove(watcher)
+			end)
+
+			local function onChildAdded(inst: Instance)
+				local inner = watcher:Extend()
+				local changed = inner:Extend()
+
+				local function onValueChanged()
+					local value = nil
+					if inst:IsA("ValueBase") then
+						value = inst.Value
+					elseif inst:IsA("Folder") then
+						local c = table.clone(path)
+						table.insert(c, inst.Name)
+						value = assign.fromFolder(inst)
+					end
+					listener(value, tonumber(inst.Name), changed)
+				end
+
+				local function issueChange()
+					changed:Destroy()
+					onValueChanged()
+				end
+
+				onValueChanged()
+				inner:Connect(inst.Destroying, function()
+					watcher:Remove(inner)
+				end)
+				inner:Connect(inst.Changed, issueChange)
+				inner:Connect(inst:GetPropertyChangedSignal("Name"), issueChange)
+			end
+
+			for _, inst in folder:GetChildren() do
+				task.spawn(onChildAdded, inst)
+			end
+			watcher:Connect(folder.ChildAdded, onChildAdded)
+		end
+	end
+	onDescendantsChanged()
+	trove:Connect(self._dataFolder.DescendantAdded, onDescendantsChanged)
+
+	return function()
+		trove:Destroy()
+	end
+end
+
+--[=[
+	Observe Values within data, given the path array. The value does not have to exist at any point to be observed.
+	The listener will run the moment the path provided yields a value.
+
+	Table values will trigger the listener but will not subscribe to changes, see `State.ObserveArray`
+	```lua
+	State:ObserveValue({ "Name" }, function(value, trove)
+		print(value)
+		trove:Add(function()
+			print("value was removed")
+		end)
+	end)
+	```
+	You **can** observe individual table fields
+	```lua
+	State:SetValue({ "Names", "Jane" }, true)
+
+	State:ObserveValue({ "Names", "Jane" }, function(value, trove) end)
+	```
+]=]
+function State.ObserveValue(self: State, path: { string }, listener: (value: assign.ValueBaseCompatible, trove: Trove.Trove) -> ())
 	local trove = self.Trove:Extend()
 	local isTracking = false
 	local pathString = table.concat(path, "/")
@@ -332,7 +511,7 @@ function State.ObserveChange(self: State, path: { string }, listener: (value: an
 			elseif valueBase:IsA("Folder") then
 				task.spawn(listener, getFromPath(self.Data, path), inner)
 				warn(
-					`[State.ObserveChange]: path "{pathString}" is a table value`
+					`[State.ObserveValue]: path "{pathString}" is a table value`
 						.. `\nChanges to its members will not be reflected`
 						.. `\nConsider listening to the tables fields instead`
 				)
@@ -477,7 +656,8 @@ function StateManager.observeInstance(instance: Instance, className: string, lis
 				end
 			else
 				warn(
-					`[StateManager.observeInstance]: An unknown instance entered {folder:GetFullName()}\nName: {pointer.Name}\nClass: {pointer.ClassName}`
+					`[StateManager.observeInstance]: An unknown instance entered {folder:GetFullName()}`
+						.. `\nName: {pointer.Name}\nClass: {pointer.ClassName}`
 				)
 			end
 		end
