@@ -1,7 +1,6 @@
 {
 	"name": "state-manager",
 	"tree": {
-		"$className": "DataModel",
 		"$path": "src"
 	}
 }
