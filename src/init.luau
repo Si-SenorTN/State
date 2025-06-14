@@ -59,7 +59,10 @@ export type State = {
 	ArrayInsert: (self: State, path: { string }, value: assign.ValueBaseCompatible, index: number?) -> (),
 	ArrayRemove: (self: State, path: { string }, index: number) -> (),
 
-	ObserveValue: (self: State, path: { string }, listener: (value: assign.ValueBaseCompatible) -> ()) -> Trove.Trove,
+	Write: (self: State, funcName: string, ...any) -> (),
+	ListenToWrite: (self: State, funcName: string, listener: () -> ()) -> () -> (),
+
+	ObserveValue: (self: State, path: { string }, listener: (value: assign.ValueBaseCompatible, trove: Trove.Trove) -> ()) -> () -> (),
 	ObserveArray: (
 		self: State,
 		path: { string },
@@ -68,6 +71,7 @@ export type State = {
 
 	Associate: (self: State, instance: Instance) -> boolean,
 	IsAssociated: (self: State, instance: Instance) -> boolean,
+	GetAssociate: (self: State, name: string) -> Instance?,
 
 	Dissociate: (self: State, instance: Instance) -> boolean,
 	DissociateAll: (self: State) -> boolean,
@@ -79,10 +83,11 @@ type StateManager = {
 	new: (options: StateOptions, defaultData: { [string?]: any }) -> State,
 
 	observe: (className: string, listener: (state: State) -> ()) -> () -> (),
+	observeInstance: (instance: Instance, className: string, listener: (state: State) -> ()) -> () -> (),
 
 	getAll: (className: string) -> { State },
 	fromFolder: (stateFolder: Folder) -> State | nil,
-	fromInstance: (instance: Instance) -> State | nil,
+	fromInstance: (instance: Instance, className: string) -> State | nil,
 
 	destroy: (state: State) -> (),
 }
@@ -96,21 +101,21 @@ local function getFromPath(data: { [string]: any }, path: { string })
 	return pointer[path[#path]]
 end
 
-local function pathExists(data: { [string]: any }, path: { string })
-	local pointer = data
-	for i = 1, #path - 1 do
-		pointer = pointer[path[i]]
-		if pointer == nil then
-			return false
-		end
-	end
-	return true
-end
-
 local function setFromPath(data: { [string]: any }, path: { string }, newValue: any)
 	local pointer = data
 	for i = 1, #path - 1 do
 		pointer = pointer[path[i]]
+	end
+	pointer[path[#path]] = newValue
+end
+
+local function trySetFromPath(data: { [string]: any }, path: { string }, newValue: any)
+	local pointer = data
+	for i = 1, #path - 1 do
+		pointer = pointer[path[i]]
+		if pointer == nil then
+			return
+		end
 	end
 	pointer[path[#path]] = newValue
 end
@@ -201,14 +206,13 @@ function State.new(stateFolder: Folder)
 		if valueBase:IsA("ValueBase") then
 			local inner = watchingValueBases:Extend()
 			local path = walkUpPath(self._dataFolder, valueBase)
+
 			local function onValueChanged(newValue)
 				setFromPath(self.Data, path, newValue)
 			end
 
 			inner:Connect(valueBase.Destroying, function()
-				if pathExists(self.Data, path) then
-					setFromPath(self.Data, path, nil)
-				end
+				trySetFromPath(self.Data, path, nil)
 				watchingValueBases:Remove(inner)
 			end)
 			inner:Connect(valueBase.Changed, onValueChanged)
@@ -216,9 +220,10 @@ function State.new(stateFolder: Folder)
 		elseif valueBase:IsA("Folder") then
 			local inner = watchingValueBases:Extend()
 			local path = walkUpPath(self._dataFolder, valueBase)
+
 			setFromPath(self.Data, path, assign.fromFolder(valueBase))
 			inner:Connect(valueBase.Destroying, function()
-				setFromPath(self.Data, path, nil)
+				trySetFromPath(self.Data, path, nil)
 				watchingValueBases:Remove(inner)
 			end)
 		end
@@ -317,6 +322,17 @@ function State.IsAssociated(self: State, instance: Instance)
 	return false
 end
 
+function State.GetAssociate(self: State, name: string)
+	local associates = self._instance:FindFirstChild(ASSOCIATES_FOLDER_NAME)
+	if associates then
+		local associate = associates:FindFirstChild(name)
+		if associate then
+			return associate.Value
+		end
+	end
+	return nil
+end
+
 local function unsafeDissociate(className: string, pointer: ObjectValue)
 	local inst = pointer.Value
 	local proxyFolder = inst:FindFirstChild(PROXY_FOLDER_NAME)
@@ -366,10 +382,6 @@ function State.DissociateAll(self: State)
 end
 
 function State.SetValue(self: State, path: { string }, value: assign.ValueBaseCompatible)
-	if not assign.isValidType(typeof(value)) then
-		error(`[State.SetValue]: Invalid type "{typeof(value)}". Cannot convert to a ValueBase or Folder`)
-	end
-
 	if RunService:IsClient() and self._instance:GetAttribute("RunContext") == "server" then
 		error(ERR_INCORRECT_RUN_CONTEXT:format("State", "SetValue", "change"), 2)
 	end
@@ -395,16 +407,12 @@ function State.SetValue(self: State, path: { string }, value: assign.ValueBaseCo
 		end
 	end
 
-	if valueBase and (valueBase:IsA("ValueBase") or valueBase:IsA("Folder")) then
+	if valueBase then
 		if value == NIL_TOKEN then
 			valueBase:Destroy()
 		elseif valueBase:IsA("ValueBase") then
-			if typeof(value) ~= typeof(valueBase.Value) then
-				error("[State.SetValue]: You cannot change a fields data type.\nConsider Setting the value to Nil and then setting it")
-			else
-				valueBase.Value = value
-			end
-		else
+			valueBase.Value = value -- let this error. thats what the free type checking is for, and we were throwing an error after a type check anyways
+		elseif valueBase:IsA("Folder") then
 			error("[State.SetValue]: Cannot change a tables value. Consider setting it to Nil and then setting it", 2)
 		end
 	else
@@ -413,10 +421,6 @@ function State.SetValue(self: State, path: { string }, value: assign.ValueBaseCo
 end
 
 function State.ArrayInsert(self: State, path: { string }, value: assign.ValueBaseCompatible, index: number?)
-	if not assign.isValidType(typeof(value)) then
-		error(`[State.ArrayInsert]: Invalid type "{typeof(value)}". Cannot convert to a ValueBase or Folder`, 2)
-	end
-
 	if value == NIL_TOKEN then
 		error("[State.ArrayInsert]: Cannot insert a Nil Token", 2)
 	end
