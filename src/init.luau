@@ -279,7 +279,7 @@ function State.ListenToWrite(self: State, funcName: string, listener: () -> ())
 	end
 end
 
-function State.Associate(self: State, instance: Instance)
+function State.Associate(self: State, instance: Instance, key: string?)
 	if RunService:IsClient() and self._instance:GetAttribute("RunContext") == "server" then
 		error(ERR_INCORRECT_RUN_CONTEXT:format("State", "Associate", "associate"), 2)
 	end
@@ -299,7 +299,7 @@ function State.Associate(self: State, instance: Instance)
 	end
 
 	local pointer = Instance.new("ObjectValue")
-	pointer.Name = instance.Name
+	pointer.Name = key or instance.Name
 	pointer.Value = instance
 	pointer.Parent = self._associatesFolder
 
